@@ -33,6 +33,16 @@ python src/audio_automation_utils.py --help
 python src/audio_automation_utils.py inventory /path/to/folder --output inventory.csv
 ```
 
+### Filter inventory by extension
+
+```bash
+# Only include .wav files
+python src/audio_automation_utils.py inventory /path/to/folder --ext .wav --output wav_files.csv
+
+# Combine with recursive scan
+python src/audio_automation_utils.py inventory /path/to/folder --ext .frd --recursive
+```
+
 ### Batch rename with dry-run
 
 ```bash
@@ -48,6 +58,12 @@ python src/audio_automation_utils.py rename /path/to/folder --prefix "session01_
 ```bash
 python src/audio_automation_utils.py rename /path/to/folder --number --ext .txt --dry-run
 ```
+
+## Roadmap
+
+- Add recursive folder rename support
+- Add file filtering by extension
+- Improve CSV export formatting
 
 ## License
 

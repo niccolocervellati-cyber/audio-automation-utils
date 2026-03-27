@@ -27,11 +27,14 @@ def cmd_inventory(args):
         sys.exit(1)
 
     output_path = Path(args.output) if args.output else folder / "inventory.csv"
-    pattern = f"**/*" if args.recursive else "*"
+    pattern = "**/*" if args.recursive else "*"
+    ext_filter = args.ext.lower() if args.ext else None
 
     rows = []
     for p in sorted(folder.glob(pattern)):
         if not p.is_file():
+            continue
+        if ext_filter and p.suffix.lower() != ext_filter:
             continue
         stat = p.stat()
         rows.append({
@@ -126,6 +129,7 @@ def main():
     p_inv.add_argument("folder", help="Path to scan.")
     p_inv.add_argument("--output", "-o", help="Output CSV path (default: <folder>/inventory.csv).")
     p_inv.add_argument("--recursive", "-r", action="store_true", help="Recurse into subdirectories.")
+    p_inv.add_argument("--ext", help="Only include files with this extension, e.g. .wav (case-insensitive).")
 
     # rename
     p_ren = sub.add_parser("rename", help="Batch rename files.")
