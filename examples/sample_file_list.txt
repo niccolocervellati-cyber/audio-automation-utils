@@ -1,0 +1,27 @@
+# Sample filenames — typical audio measurement and project session files
+
+sweep_ref_48k_20240301.wav
+sweep_nearfield_woofer_take1.wav
+sweep_nearfield_woofer_take2.wav
+sweep_farfield_1m_0deg.wav
+sweep_farfield_1m_15deg.wav
+sweep_farfield_1m_30deg.wav
+sweep_farfield_1m_45deg.wav
+
+rew_measurement_export_2024-03-01.txt
+rew_measurement_export_2024-03-02.txt
+impulse_response_raw.wav
+impulse_response_windowed.wav
+
+cab_12inch_sealed_v1.frd
+cab_12inch_sealed_v2.frd
+cab_12inch_reflex_tuned55hz.frd
+cab_15inch_reflex_v1.frd
+
+driver_datasheet_scan_001.pdf
+driver_datasheet_scan_002.pdf
+driver_datasheet_scan_003.pdf
+
+session_notes_2024-03-01.txt
+session_notes_2024-03-08.txt
+project_log.txt
