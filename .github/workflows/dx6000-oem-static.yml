@@ -1,0 +1,355 @@
+name: DX6000 OEM static analysis
+
+on:
+  push:
+    branches:
+      - dx6000-oem-static-20260922
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full unshield cabextract binutils file unzip ssdeep
+          python3 -m pip install --quiet pefile capstone
+
+      - name: Download official OEM archives
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/downloads work/extracted work/analysis
+          curl -fL --retry 4 --retry-all-errors -A 'Mozilla/5.0' \
+            'https://www.gae.de/resources/Downloads/History/Electronics/GAE-V3.2.0.1.zip' \
+            -o work/downloads/GAE-V3.2.0.1.zip
+          curl -fL --retry 4 --retry-all-errors -A 'Mozilla/5.0' \
+            -e 'https://www.seeburg.net/en/downloads?alpha=1' \
+            'https://www.seeburg.net/download_getfile.php?file=downloads_EN%2F10-SOFTWARE%2FHDSC%2FHDSC-2-4_Version-4-0.zip' \
+            -o work/downloads/HDSC-2-4_Version-4-0.zip
+          sha256sum work/downloads/*.zip | tee work/analysis/archive_sha256.txt
+          file work/downloads/*.zip | tee work/analysis/archive_file.txt
+          unzip -l work/downloads/GAE-V3.2.0.1.zip | tee work/analysis/gae_zip_listing.txt
+          unzip -l work/downloads/HDSC-2-4_Version-4-0.zip | tee work/analysis/seeburg_zip_listing.txt
+
+      - name: Extract archives and InstallShield payloads
+        shell: bash
+        run: |
+          set -euxo pipefail
+          unzip -q work/downloads/GAE-V3.2.0.1.zip -d work/extracted/gae_zip
+          unzip -q work/downloads/HDSC-2-4_Version-4-0.zip -d work/extracted/seeburg_zip
+
+          # Try common legacy InstallShield extraction paths without executing Windows code.
+          for root in work/extracted/gae_zip work/extracted/seeburg_zip; do
+            tag="$(basename "$root")"
+            mkdir -p "work/extracted/${tag}_7z" "work/extracted/${tag}_unshield"
+            while IFS= read -r -d '' f; do
+              case "${f,,}" in
+                *.exe)
+                  7z x -y -o"work/extracted/${tag}_7z/$(basename "$f").d" "$f" >/dev/null 2>&1 || true
+                  ;;
+                *.cab)
+                  unshield -d "work/extracted/${tag}_unshield/$(basename "$f").d" x "$f" >/dev/null 2>&1 || true
+                  7z x -y -o"work/extracted/${tag}_7z/$(basename "$f").d" "$f" >/dev/null 2>&1 || true
+                  ;;
+              esac
+            done < <(find "$root" -type f -print0)
+          done
+
+          find work/extracted -type f -printf '%p\n' | sort > work/analysis/all_extracted_files.txt
+          while IFS= read -r f; do file "$f"; done < work/analysis/all_extracted_files.txt > work/analysis/all_file_types.txt
+          grep -Ei 'PE32|MS-DOS executable|InstallShield|Cabinet' work/analysis/all_file_types.txt > work/analysis/interesting_file_types.txt || true
+
+      - name: Static PE and serial-protocol analysis
+        shell: bash
+        run: |
+          cat > work/analyze_pe.py <<'PY'
+          import os, re, json, hashlib, struct, math
+          from pathlib import Path
+          import pefile
+          from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+          from capstone.x86_const import X86_OP_IMM, X86_OP_MEM
+
+          ROOT = Path("work/extracted")
+          OUT = Path("work/analysis")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          KEYWORDS = [
+              "GAE", "DSC24", "HDSC", "SEEBURG", "A3R", "DC24", "LMS244",
+              "COM1", "COM2", "COM3", "COM4", "38400", "START",
+              "Version", "Program", "System", "Update OS", "Clone", "Memory",
+              "Get DSP Version", "Get DSP System", "Read Program", "Write Program",
+              "Store Configuration", "Change Config", "Update DSP", "Update System"
+          ]
+          SERIAL_IMPORTS = {
+              "CreateFileA","CreateFileW","SetCommState","GetCommState","SetCommTimeouts",
+              "SetupComm","EscapeCommFunction","ClearCommError","PurgeComm",
+              "ReadFile","WriteFile","CloseHandle","GetOverlappedResult"
+          }
+          CMD_IMMS = {0xAB:"AB",0xAC:"AC",0x6F:"GET_VERSION?",0x0B:"READ_PROGRAM?",0x65:"GET_SYSTEM?"}
+          BAUD = 38400
+
+          def sha256(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1<<20), b''): h.update(b)
+              return h.hexdigest()
+
+          def raw_strings(data, minlen=4):
+              out=[]
+              for m in re.finditer(rb'[ -~]{%d,}'%minlen,data):
+                  try: s=m.group().decode('latin1')
+                  except: continue
+                  out.append((m.start(),s,'ascii'))
+              # simple UTF-16LE printable run
+              pat = re.compile(rb'(?:(?:[ -~])\x00){%d,}'%minlen)
+              for m in pat.finditer(data):
+                  try: s=m.group().decode('utf-16le')
+                  except: continue
+                  out.append((m.start(),s,'utf16le'))
+              return sorted(out)
+
+          def off_to_rva(pe, off):
+              for s in pe.sections:
+                  a=s.PointerToRawData
+                  b=a+s.SizeOfRawData
+                  if a <= off < b:
+                      return s.VirtualAddress + (off-a)
+              return None
+
+          def va_ref_locations(pe, target_va):
+              needle=struct.pack('<I',target_va & 0xffffffff)
+              locs=[]
+              for s in pe.sections:
+                  if not (s.Characteristics & 0x20000000):
+                      continue
+                  data=s.get_data()
+                  start=0
+                  while True:
+                      i=data.find(needle,start)
+                      if i<0: break
+                      locs.append(pe.OPTIONAL_HEADER.ImageBase+s.VirtualAddress+i)
+                      start=i+1
+              return locs
+
+          def nearest_window(insns, addr, before=18, after=28):
+              idx=min(range(len(insns)), key=lambda i:abs(insns[i].address-addr))
+              lo=max(0,idx-before); hi=min(len(insns),idx+after+1)
+              return insns[lo:hi]
+
+          def fmt_ins(i):
+              return f"{i.address:08X}: {i.mnemonic:<8} {i.op_str}"
+
+          def parse_one(p):
+              data=p.read_bytes()
+              try:
+                  pe=pefile.PE(data=data, fast_load=False)
+              except Exception:
+                  return None
+              if pe.FILE_HEADER.Machine != 0x14c:
+                  mode="other"
+              else:
+                  mode="x86"
+
+              imports=[]
+              iat={}
+              if hasattr(pe,'DIRECTORY_ENTRY_IMPORT'):
+                  for d in pe.DIRECTORY_ENTRY_IMPORT:
+                      dll=d.dll.decode(errors='replace') if d.dll else ''
+                      for imp in d.imports:
+                          name=(imp.name.decode(errors='replace') if imp.name else f"ord:{imp.ordinal}")
+                          imports.append((dll,name,imp.address))
+                          iat[name]=imp.address
+
+              strings=raw_strings(data)
+              keyhits=[]
+              score=0
+              for off,s,enc in strings:
+                  sl=s.lower()
+                  hits=[k for k in KEYWORDS if k.lower() in sl]
+                  if hits:
+                      score += len(hits)
+                      keyhits.append((off,s,enc,hits))
+
+              sections=[]
+              for s in pe.sections:
+                  name=s.Name.rstrip(b'\0').decode(errors='replace')
+                  blob=s.get_data()
+                  sections.append({
+                      'name':name,'rva':hex(s.VirtualAddress),'raw_size':s.SizeOfRawData,
+                      'virt_size':s.Misc_VirtualSize,'chars':hex(s.Characteristics),
+                      'sha256':hashlib.sha256(blob).hexdigest()
+                  })
+
+              out={
+                  'path':str(p),'size':len(data),'sha256':sha256(p),'machine':hex(pe.FILE_HEADER.Machine),
+                  'timestamp':pe.FILE_HEADER.TimeDateStamp,'imagebase':hex(pe.OPTIONAL_HEADER.ImageBase),
+                  'entry_rva':hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint),
+                  'imphash':pe.get_imphash(),'imports':imports,'sections':sections,
+                  'keyword_score':score,'keyword_hits':keyhits[:500]
+              }
+
+              if mode!="x86":
+                  return out
+
+              md=Cs(CS_ARCH_X86,CS_MODE_32); md.detail=True
+              insns=[]
+              for s in pe.sections:
+                  if s.Characteristics & 0x20000000:
+                      base=pe.OPTIONAL_HEADER.ImageBase+s.VirtualAddress
+                      insns.extend(list(md.disasm(s.get_data(),base)))
+
+              serial_calls=[]
+              for api in sorted(SERIAL_IMPORTS):
+                  iva=iat.get(api)
+                  if not iva: continue
+                  # raw x86 indirect call/jmp via absolute IAT: FF 15 addr32 / FF 25 addr32
+                  for s in pe.sections:
+                      if not (s.Characteristics & 0x20000000): continue
+                      blob=s.get_data(); secva=pe.OPTIONAL_HEADER.ImageBase+s.VirtualAddress
+                      for op in (b'\xff\x15',b'\xff\x25'):
+                          needle=op+struct.pack('<I',iva & 0xffffffff)
+                          st=0
+                          while True:
+                              j=blob.find(needle,st)
+                              if j<0: break
+                              va=secva+j
+                              serial_calls.append((api,va,'call' if op==b'\xff\x15' else 'jmp'))
+                              st=j+1
+
+              # Find direct calls to import thunks: jmp [IAT] location -> direct E8 xref to thunk.
+              thunks={}
+              for api,va,kind in serial_calls:
+                  if kind=='jmp': thunks.setdefault(api,set()).add(va)
+              for api,targets in thunks.items():
+                  for t in list(targets):
+                      for ins in insns:
+                          if ins.mnemonic=='call' and ins.operands and ins.operands[0].type==X86_OP_IMM and ins.operands[0].imm==t:
+                              serial_calls.append((api,ins.address,'call_thunk'))
+
+              # baud constant use sites in disassembly
+              baud_sites=[]
+              cmd_sites=[]
+              for ins in insns:
+                  vals=[]
+                  for op in ins.operands:
+                      if op.type==X86_OP_IMM: vals.append(op.imm & 0xffffffff)
+                      elif op.type==X86_OP_MEM and op.mem.base==0 and op.mem.index==0:
+                          vals.append(op.mem.disp & 0xffffffff)
+                  if BAUD in vals:
+                      baud_sites.append(ins.address)
+                  for v,label in CMD_IMMS.items():
+                      if v in vals:
+                          cmd_sites.append((label,v,ins.address))
+
+              # Keyword string VAs and code xrefs.
+              string_xrefs=[]
+              for off,s,enc,hits in keyhits:
+                  rva=off_to_rva(pe,off)
+                  if rva is None: continue
+                  va=pe.OPTIONAL_HEADER.ImageBase+rva
+                  refs=va_ref_locations(pe,va)
+                  if refs:
+                      string_xrefs.append({'string':s[:300],'encoding':enc,'va':hex(va),'refs':[hex(x) for x in refs[:30]],'hits':hits})
+
+              # Contexts around serial calls / baud / selected command immediates.
+              ctx=[]
+              important=[('SERIAL_'+api,va) for api,va,kind in serial_calls if kind!='jmp']
+              important += [('BAUD_38400',a) for a in baud_sites]
+              # Keep command immediate sites only if within 0x500 bytes of a WriteFile/ReadFile call or baud site.
+              anchors=[va for api,va,kind in serial_calls if api in ('WriteFile','ReadFile') and kind!='jmp']+baud_sites
+              for label,v,a in cmd_sites:
+                  if any(abs(a-z) <= 0x500 for z in anchors):
+                      important.append((f'CMD_{label}_{v:02X}',a))
+              seen=set()
+              for tag,a in important:
+                  key=(tag,a)
+                  if key in seen: continue
+                  seen.add(key)
+                  win=nearest_window(insns,a)
+                  ctx.append({'tag':tag,'address':hex(a),'disasm':[fmt_ins(i) for i in win]})
+
+              out.update({
+                  'serial_imports':[x for x in imports if x[1] in SERIAL_IMPORTS],
+                  'serial_calls':[{'api':a,'va':hex(v),'kind':k} for a,v,k in serial_calls],
+                  'baud_sites':[hex(x) for x in baud_sites],
+                  'command_sites_near_serial':[{'label':l,'value':hex(v),'va':hex(a)} for l,v,a in cmd_sites if any(abs(a-z)<=0x500 for z in anchors)],
+                  'string_xrefs':string_xrefs,
+                  'contexts':ctx
+              })
+              return out
+
+          pe_paths=[]
+          for p in ROOT.rglob('*'):
+              if not p.is_file(): continue
+              try:
+                  b=p.read_bytes()[:2]
+              except: continue
+              if b==b'MZ':
+                  pe_paths.append(p)
+
+          results=[]
+          for p in pe_paths:
+              r=parse_one(p)
+              if r: results.append(r)
+
+          results.sort(key=lambda r:(r.get('keyword_score',0),r.get('size',0)),reverse=True)
+          (OUT/'pe_inventory.json').write_text(json.dumps(results,indent=2,ensure_ascii=False),encoding='utf-8')
+
+          with (OUT/'pe_rank.txt').open('w',encoding='utf-8') as f:
+              for r in results:
+                  f.write(f"SCORE={r.get('keyword_score',0):3d} SIZE={r['size']:9d} SHA256={r['sha256']} IMPHASH={r.get('imphash')} PATH={r['path']}\n")
+
+          # Save full printable strings for top likely application binaries.
+          for idx,r in enumerate(results[:8]):
+              p=Path(r['path']); data=p.read_bytes()
+              with (OUT/f"strings_top{idx}_{p.name}.txt").open('w',encoding='utf-8',errors='replace') as f:
+                  for off,s,enc in raw_strings(data):
+                      f.write(f"{off:08X}\t{enc}\t{s}\n")
+
+          # Concise human-readable serial report for top candidates.
+          with (OUT/'serial_report.txt').open('w',encoding='utf-8') as f:
+              for r in results[:10]:
+                  f.write("\n"+"="*100+"\n")
+                  f.write(f"PATH: {r['path']}\nSHA256: {r['sha256']}\nSIZE: {r['size']}\nIMPHASH: {r.get('imphash')}\nKEYWORD_SCORE: {r.get('keyword_score')}\n")
+                  f.write("SERIAL IMPORTS:\n")
+                  for dll,name,addr in r.get('serial_imports',[]): f.write(f"  {dll}!{name} IAT={addr:08X}\n")
+                  f.write("SERIAL CALLS:\n")
+                  for x in r.get('serial_calls',[]): f.write(f"  {x}\n")
+                  f.write("BAUD 38400 SITES: "+", ".join(r.get('baud_sites',[]))+"\n")
+                  f.write("COMMAND CANDIDATES NEAR SERIAL: "+json.dumps(r.get('command_sites_near_serial',[]))+"\n")
+                  f.write("KEYWORD STRING XREFS:\n")
+                  for x in r.get('string_xrefs',[])[:80]: f.write("  "+json.dumps(x,ensure_ascii=False)+"\n")
+                  f.write("DISASSEMBLY CONTEXTS:\n")
+                  for c in r.get('contexts',[])[:120]:
+                      f.write(f"\n-- {c['tag']} @ {c['address']} --\n")
+                      f.write("\n".join(c['disasm'])+"\n")
+          PY
+
+          python3 work/analyze_pe.py
+          cat work/analysis/pe_rank.txt
+          sed -n '1,1200p' work/analysis/serial_report.txt
+
+      - name: Fuzzy hashes for likely OEM binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find work/extracted -type f -print0 | while IFS= read -r -d '' f; do
+            if head -c2 "$f" 2>/dev/null | grep -q 'MZ'; then
+              ssdeep "$f" || true
+            fi
+          done | tee work/analysis/ssdeep_all_pe.txt
+
+      - name: Upload complete analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: dx6000-oem-static-analysis
+          path: |
+            work/analysis
+            work/downloads
+            work/extracted
+          retention-days: 3
