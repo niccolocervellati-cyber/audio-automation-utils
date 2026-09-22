@@ -71,6 +71,7 @@ jobs:
 
           extract_is3 "work/extracted/gae_zip/GAE V3.2.0.1 (11-Nov-2004)" "work/extracted/gae_is3"
           extract_is3 "work/extracted/seeburg_zip/HDSC 2.4_Version 4.0" "work/extracted/seeburg_is3"
+          extract_is3 "work/extracted/ram_zip" "work/extracted/ram_is3"
 
           find work/extracted -type f -printf '%p\n' | sort > work/analysis/all_extracted_files.txt
           while IFS= read -r f; do file "$f"; done < work/analysis/all_extracted_files.txt > work/analysis/all_file_types.txt
@@ -208,7 +209,7 @@ jobs:
               if mode!="x86":
                   return out
 
-              md=Cs(CS_ARCH_X86,CS_MODE_32); md.detail=True
+              md=Cs(CS_ARCH_X86,CS_MODE_32); md.detail=True; md.skipdata=True
               insns=[]
               for s in pe.sections:
                   if s.Characteristics & 0x20000000:
