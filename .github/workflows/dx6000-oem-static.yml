@@ -43,22 +43,28 @@ jobs:
           unzip -q work/downloads/GAE-V3.2.0.1.zip -d work/extracted/gae_zip
           unzip -q work/downloads/HDSC-2-4_Version-4-0.zip -d work/extracted/seeburg_zip
 
-          # Try common legacy InstallShield extraction paths without executing Windows code.
-          for root in work/extracted/gae_zip work/extracted/seeburg_zip; do
-            tag="$(basename "$root")"
-            mkdir -p "work/extracted/${tag}_7z" "work/extracted/${tag}_unshield"
-            while IFS= read -r -d '' f; do
-              case "${f,,}" in
-                *.exe)
-                  7z x -y -o"work/extracted/${tag}_7z/$(basename "$f").d" "$f" >/dev/null 2>&1 || true
-                  ;;
-                *.cab)
-                  unshield -d "work/extracted/${tag}_unshield/$(basename "$f").d" x "$f" >/dev/null 2>&1 || true
-                  7z x -y -o"work/extracted/${tag}_7z/$(basename "$f").d" "$f" >/dev/null 2>&1 || true
-                  ;;
-              esac
-            done < <(find "$root" -type f -print0)
-          done
+          # These are legacy InstallShield 3 archives (_SETUP.1 / _SETUP.LIB).
+          # unshield targets v5+, so use idecomp for the actual application payload.
+          git clone -q --depth 1 https://github.com/lephilousophe/idecomp.git work/tools/idecomp
+
+          extract_is3 () {
+            src="$1"
+            dst="$2"
+            mkdir -p "$dst"
+            cp "$src"/_SETUP.* "$dst"/ 2>/dev/null || true
+            (
+              cd "$dst"
+              echo "=== HEX HEADER _SETUP.1 ==="
+              xxd -g1 -l32 _SETUP.1 || true
+              echo "=== LIST _SETUP.1 ==="
+              python3 ../../../tools/idecomp/idecomp.py -l _SETUP.1 || true
+              echo "=== EXTRACT ALL _SETUP.1 ==="
+              python3 ../../../tools/idecomp/idecomp.py -a _SETUP.1
+            )
+          }
+
+          extract_is3 "work/extracted/gae_zip/GAE V3.2.0.1 (11-Nov-2004)" "work/extracted/gae_is3"
+          extract_is3 "work/extracted/seeburg_zip/HDSC 2.4_Version 4.0" "work/extracted/seeburg_is3"
 
           find work/extracted -type f -printf '%p\n' | sort > work/analysis/all_extracted_files.txt
           while IFS= read -r f; do file "$f"; done < work/analysis/all_extracted_files.txt > work/analysis/all_file_types.txt
