@@ -1,0 +1,38 @@
+name: DX6000 RAM focused extraction
+
+on:
+  push:
+    branches: [dx6000-oem-static-20260922]
+
+jobs:
+  ram:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract RAM LMS244
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip binutils
+          mkdir -p ram/outer ram/app ram/out
+          curl -fL --retry 4 --retry-all-errors -A 'Mozilla/5.0' -e 'https://ramaudio.com/downloads/' \
+            'https://ramaudio.com/Download/RAM_LMS244.zip' -o ram/RAM_LMS244.zip
+          unzip -q ram/RAM_LMS244.zip -d ram/outer
+          git clone -q --depth 1 https://github.com/lephilousophe/idecomp.git ram/idecomp
+          cp ram/outer/_SETUP.* ram/app/
+          (cd ram/app && python3 ../idecomp/idecomp.py -a _SETUP.1)
+          APP='ram/app/Group1/RAM LMS244 V4.0d.exe'
+          sha256sum ram/RAM_LMS244.zip "$APP" | tee ram/out/hashes.txt
+          file "$APP" | tee ram/out/file.txt
+          stat -c '%s %n' "$APP" | tee ram/out/size.txt
+          strings -a -t x "$APP" | grep -Ei 'Get DSP Version|Get DSP System|Read Program|Write Program|Store Configuration|Change Config|Update DSP|Update System|Sending START|Received START|Sending COMMAND|Received COMMAND|PROGRAM NUMBER|MEMORY EMPTY|COM[1-4]|A3R|DC24|LMS244|38400' | tee ram/out/key_strings.txt || true
+          objdump -d -M intel "$APP" > ram/out/ram_objdump.txt
+          grep -nEi 'mov[[:space:]]+al,0x(6f|65|0b|02|0a|04)|mov[[:space:]]+BYTE PTR.*0x(3b|3c|aa|ab|ac)|cmp[[:space:]]+BYTE PTR.*0x(3b|3c|aa|ab|ac)' ram/out/ram_objdump.txt | tee ram/out/protocol_immediates.txt || true
+          grep -nEi 'call.*WriteFile|call.*ReadFile|SetCommState|SetCommTimeouts|SetupComm|PurgeComm' ram/out/ram_objdump.txt | head -400 | tee ram/out/serial_refs.txt || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dx6000-ram-focused
+          path: ram
+          retention-days: 3
