@@ -31,10 +31,15 @@ jobs:
             -e 'https://www.seeburg.net/en/downloads?alpha=1' \
             'https://www.seeburg.net/download_getfile.php?file=downloads_EN%2F10-SOFTWARE%2FHDSC%2FHDSC-2-4_Version-4-0.zip' \
             -o work/downloads/HDSC-2-4_Version-4-0.zip
+          curl -fL --retry 4 --retry-all-errors -A 'Mozilla/5.0' \
+            -e 'https://ramaudio.com/downloads/' \
+            'https://ramaudio.com/Download/RAM_LMS244.zip' \
+            -o work/downloads/RAM_LMS244.zip
           sha256sum work/downloads/*.zip | tee work/analysis/archive_sha256.txt
           file work/downloads/*.zip | tee work/analysis/archive_file.txt
           unzip -l work/downloads/GAE-V3.2.0.1.zip | tee work/analysis/gae_zip_listing.txt
           unzip -l work/downloads/HDSC-2-4_Version-4-0.zip | tee work/analysis/seeburg_zip_listing.txt
+          unzip -l work/downloads/RAM_LMS244.zip | tee work/analysis/ram_zip_listing.txt
 
       - name: Extract archives and InstallShield payloads
         shell: bash
@@ -42,6 +47,7 @@ jobs:
           set -euxo pipefail
           unzip -q work/downloads/GAE-V3.2.0.1.zip -d work/extracted/gae_zip
           unzip -q work/downloads/HDSC-2-4_Version-4-0.zip -d work/extracted/seeburg_zip
+          unzip -q work/downloads/RAM_LMS244.zip -d work/extracted/ram_zip
 
           # These are legacy InstallShield 3 archives (_SETUP.1 / _SETUP.LIB).
           # unshield targets v5+, so use idecomp for the actual application payload.
@@ -57,9 +63,9 @@ jobs:
               echo "=== HEX HEADER _SETUP.1 ==="
               xxd -g1 -l32 _SETUP.1 || true
               echo "=== LIST _SETUP.1 ==="
-              python3 ../../../tools/idecomp/idecomp.py -l _SETUP.1 || true
+              python3 ../../tools/idecomp/idecomp.py -l _SETUP.1 || true
               echo "=== EXTRACT ALL _SETUP.1 ==="
-              python3 ../../../tools/idecomp/idecomp.py -a _SETUP.1
+              python3 ../../tools/idecomp/idecomp.py -a _SETUP.1
             )
           }
 
