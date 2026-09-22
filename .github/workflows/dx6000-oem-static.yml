@@ -249,6 +249,8 @@ jobs:
               cmd_sites=[]
               for ins in insns:
                   vals=[]
+                  if getattr(ins, "id", 0) == 0:
+                      continue
                   for op in ins.operands:
                       if op.type==X86_OP_IMM: vals.append(op.imm & 0xffffffff)
                       elif op.type==X86_OP_MEM and op.mem.base==0 and op.mem.index==0:
